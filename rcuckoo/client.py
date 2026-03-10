@@ -1,40 +1,38 @@
 """
-Client state machine for RCuckoo operations (Section 3.2).
+Client state machine for RCuckoo operations.
 
-Each phase corresponds to one RDMA round trip:
-- Read: 1 RTT (Section 3.2.1)
-- Update: 2 RTTs minimum (Section 3.2.2)
-- Insert: 2+ RTTs (Section 3.2.3)
+Each non-IDLE phase corresponds to one RDMA round trip:
+- Read: 1 RTT
+- Update: 2 RTTs minimum (lock + write)
+- Insert: 2+ RTTs (lock + search + write)
 """
 
 from collections import deque
 
-# Operation phases - each consumes 1 RDMA round trip
+# Operation phases — each consumes 1 RDMA round trip
 PHASE_IDLE = 0
-PHASE_READ_ISSUED = 1      # Read: RDMA read both rows (1 RTT)
-PHASE_UPDATE_LOCK = 2      # Update: try acquire locks (1 RTT)
-PHASE_UPDATE_WRITE = 4     # Update: write + release (1 RTT)
-PHASE_INSERT_LOCK = 5      # Insert: try acquire locks (1 RTT)
-PHASE_INSERT_SEARCH = 6    # Insert: search within locked rows
-PHASE_INSERT_WRITE = 7     # Insert: execute cuckoo path + release
+PHASE_READ_ISSUED = 1
+PHASE_UPDATE_LOCK = 2
+PHASE_UPDATE_WRITE = 4
+PHASE_INSERT_LOCK = 5
+PHASE_INSERT_SEARCH = 6   # no RDMA — uses cached data
+PHASE_INSERT_WRITE = 7
 
 
 class ClientState:
-    """State for one simulated client."""
-
     __slots__ = [
         'client_id', 'phase', 'op_type', 'op_key', 'op_value',
         'L1', 'L2', 'lock_indices', 'acquired_locks',
         'mcas_groups', 'mcas_group_idx',
         'ops_completed', 'lock_retries',
         'cache', 'cache_order', 'max_cache_rows',
-        'locked_rows'
+        'locked_rows', 'rdma_calls', 'ticks_remaining',
     ]
 
     def __init__(self, client_id: int, max_cache_rows: int):
         self.client_id = client_id
         self.phase = PHASE_IDLE
-        self.op_type = None  # 'read' or 'update'
+        self.op_type = None
         self.op_key = 0
         self.op_value = 0
         self.L1 = 0
@@ -49,9 +47,10 @@ class ClientState:
         self.cache_order = deque()
         self.max_cache_rows = max_cache_rows
         self.locked_rows = set()
+        self.rdma_calls = 0
+        self.ticks_remaining = 0
 
     def cache_row(self, row_idx: int, keys, values):
-        """Cache a row's data with LRU eviction (Section 3.2.3, 5.1: 64KB cache)."""
         if row_idx in self.cache:
             self.cache[row_idx] = (keys.copy(), values.copy())
             return

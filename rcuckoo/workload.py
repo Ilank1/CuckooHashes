@@ -1,11 +1,4 @@
-"""
-Workload generation and table pre-population (Section 5.3).
-
-Grant & Snoeren, ATC'25:
-    "pre-populate it with 90 M entries that each consist of a 32-bit
-    key and 32-bit value"
-    "Zipf(0.99) distribution"
-"""
+"""Workload generation and table pre-population."""
 
 import time
 
@@ -20,11 +13,8 @@ def ycsb_zipf_keys(num_keys: int, theta: float, size: int) -> np.ndarray:
     """
     Generate YCSB-compatible bounded Zipfian key indices over [0, num_keys).
 
-    YCSB Zipf(theta) over N items: P(rank k) ~ 1/(k+1)^theta for k=0..N-1.
-    This differs from np.random.zipf(a), which generates unbounded Zeta samples.
-
-    Implements the standard YCSB ZipfianGenerator algorithm:
-        https://github.com/brianfrankcooper/YCSB (ZipfianGenerator.java)
+    Implements the YCSB ZipfianGenerator algorithm:
+        P(rank k) ~ 1/(k+1)^theta for k=0..N-1
     """
     N = num_keys
     if abs(theta - 1.0) < 1e-6:
@@ -32,7 +22,6 @@ def ycsb_zipf_keys(num_keys: int, theta: float, size: int) -> np.ndarray:
 
     alpha = 1.0 / (1.0 - theta)
 
-    # H(N, theta) via Euler-Maclaurin approximation
     zeta_n = (N**(1 - theta) - 1) / (1 - theta) + 0.5 * (1 + N**(-theta))
     zeta_2 = 1.0 + 1.0 / 2.0**theta
 
@@ -59,12 +48,9 @@ def ycsb_zipf_keys(num_keys: int, theta: float, size: int) -> np.ndarray:
 def generate_workload(workload_type: str, num_keys: int, zipf_theta: float,
                       num_ops: int):
     """
-    Generate a YCSB workload (Section 5.3).
+    Generate a YCSB workload.
 
-    Workloads:
-    - YCSB-C: 100% read
-    - YCSB-B: 95% read, 5% update
-    - YCSB-A: 50% read, 50% update
+    YCSB-C: 100% read, YCSB-B: 95% read / 5% update, YCSB-A: 50/50.
     """
     if workload_type == "ycsb-c":
         read_ratio = 1.0
@@ -83,11 +69,7 @@ def generate_workload(workload_type: str, num_keys: int, zipf_theta: float,
 
 
 def prepopulate(table: IndexTable, config: RCuckooConfig, fill_fraction: float):
-    """
-    Pre-populate the index table (Section 5.3).
-
-    Uses batch hash computation and row-fill tracking for speed.
-    """
+    """Pre-populate the index table to the given fill fraction."""
     target = int(config.total_entries * fill_fraction)
     print(f"Pre-populating table: {target:,} entries "
           f"({fill_fraction*100:.0f}% of {config.total_entries:,})...")

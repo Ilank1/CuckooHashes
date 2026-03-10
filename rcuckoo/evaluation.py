@@ -1,13 +1,4 @@
-"""
-Figure 6 evaluation (Section 5.3).
-
-Grant & Snoeren, ATC'25:
-    "Figure 6 shows YCSB throughput for RCuckoo, FUSEE, Clover, and
-    Sherman on three different YCSB workloads."
-
-Runs YCSB-A/B/C across varying client counts and plots simulation
-results against reported reference values.
-"""
+"""Throughput evaluation: YCSB-A/B/C across varying client counts."""
 
 import numpy as np
 
@@ -18,10 +9,7 @@ from rcuckoo.engine import run_simulation
 
 
 def run_figure6(config: RCuckooConfig):
-    """
-    Reproduce Figure 6: throughput (MOPS) vs number of clients
-    for YCSB-C, YCSB-B, and YCSB-A.
-    """
+    """Run throughput (MOPS) vs number of clients for YCSB-C, YCSB-B, YCSB-A."""
     workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
     client_counts = config.figure6_client_counts
     results = {wl: {} for wl in workloads}
@@ -31,15 +19,13 @@ def run_figure6(config: RCuckooConfig):
         print(f"WORKLOAD: {wl.upper()}")
         print(f"{'='*60}")
 
-        # Pre-create table once per workload (updates are negligible
-        # relative to table size)
         table = IndexTable(config.num_rows, config.entries_per_row)
         prepopulate(table, config, config.prepopulate_fill)
 
         for nc in client_counts:
             mops_trials = []
             for trial in range(config.num_trials):
-                mops = run_simulation(config, wl, nc, shared_table=table)
+                mops, _stats = run_simulation(config, wl, nc, shared_table=table)
                 mops_trials.append(mops)
             results[wl][nc] = np.mean(mops_trials)
 
@@ -47,9 +33,8 @@ def run_figure6(config: RCuckooConfig):
 
 
 def print_results(results: dict):
-    """Print a formatted results table."""
     print(f"\n{'='*70}")
-    print("FIGURE 6 RESULTS: Throughput (MOPS) vs Number of Clients")
+    print("Throughput (MOPS) vs Number of Clients")
     print(f"{'='*70}")
 
     workloads = list(results.keys())
@@ -72,7 +57,7 @@ def print_results(results: dict):
 
 
 def plot_results(results: dict):
-    """Plot Figure 6 style charts comparing simulation to reference values."""
+    """Plot throughput charts comparing simulation to reference values."""
     try:
         import matplotlib
         matplotlib.use('Agg')
@@ -84,7 +69,6 @@ def plot_results(results: dict):
             "ycsb-b": "(b) 95% read, 5% update (YCSB-B)",
             "ycsb-a": "(c) 50% read, 50% update (YCSB-A)"
         }
-        # Reference throughput from Section 5.3, Figure 6
         reference_data = {
             "ycsb-c": {
                 "clients": [10, 20, 40, 80, 160, 320],

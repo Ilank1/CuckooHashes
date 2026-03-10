@@ -1,12 +1,10 @@
 """
-Hash functions for dependent cuckoo hashing (Section 3.3).
+Dependent cuckoo hashing.
 
-Grant & Snoeren, ATC'25:
     L1(K) = h1(K) mod T
     L2(K) = (L1 + (h2(K) mod floor(f^(f + Z(h3(K)))))) mod T
 
 T = number of rows, Z(x) = trailing zeros of x, f = locality parameter.
-The original uses xxHash; we substitute a fast integer mixing function.
 """
 
 import numpy as np
@@ -15,7 +13,6 @@ EMPTY_KEY = np.uint32(0xFFFFFFFF)
 
 
 def _hash_with_salt(key: int, salt: int) -> int:
-    """Fast integer hash mixing (substitute for xxHash)."""
     h = (key ^ salt) & 0xFFFFFFFF
     h = (((h >> 16) ^ h) * 0x45d9f3b) & 0xFFFFFFFF
     h = (((h >> 16) ^ h) * 0x45d9f3b) & 0xFFFFFFFF
@@ -25,13 +22,7 @@ def _hash_with_salt(key: int, salt: int) -> int:
 
 def compute_locations(key: int, num_rows: int, f: float,
                       salt1: int, salt2: int, salt3: int) -> tuple:
-    """
-    Compute two cuckoo hash locations for a key.
-
-    Section 3.3:
-        L1(K) = h1(K) mod T
-        L2(K) = (L1 + (h2(K) mod floor(f^(f + Z(h3(K)))))) mod T
-    """
+    """Compute two cuckoo hash locations for a key."""
     h1 = _hash_with_salt(key, salt1)
     h2 = _hash_with_salt(key, salt2)
     h3 = _hash_with_salt(key, salt3)
@@ -51,7 +42,7 @@ def compute_locations(key: int, num_rows: int, f: float,
 
     offset = h2 % max_offset
     if offset == 0:
-        offset = 1  # Ensure L1 != L2
+        offset = 1
 
     L2 = (L1 + offset) % num_rows
     return L1, L2
@@ -59,7 +50,7 @@ def compute_locations(key: int, num_rows: int, f: float,
 
 def compute_locations_batch(keys: np.ndarray, num_rows: int, f: float,
                             salt1: int, salt2: int, salt3: int):
-    """Batch compute locations for a numpy array of keys. Fully vectorized."""
+    """Batch compute locations for a numpy array of keys."""
     keys_int = keys.astype(np.int64)
 
     def _batch_hash(k, salt):
@@ -75,7 +66,6 @@ def compute_locations_batch(keys: np.ndarray, num_rows: int, f: float,
 
     L1 = h1 % num_rows
 
-    # Vectorized trailing zeros: lsb = x & (-x), ctz = log2(lsb)
     h3_signed = h3.astype(np.int64)
     lsb = h3_signed & (-h3_signed)
     z_arr = np.zeros(len(keys), dtype=np.int64)

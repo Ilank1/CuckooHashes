@@ -1,16 +1,17 @@
 """
 Compare RCuckoo vs OfflineState on identical YCSB workloads.
 
-Generates 9 plots:
+Generates 10 plots:
 1. Zipf distribution histogram
 2. Throughput comparison (MOPS vs clients) — RCuckoo vs OfflineState
 3. OfflineState read source breakdown (local/peer/server)
 4. RDMA calls per operation vs clients
 5. Read latency CDF (staircase: local/peer/server)
-6. Bloom filter false positive rate vs clients
+6. Bloom filter false positive rate vs clients (GIBF vs merged bloom)
 7. Throughput vs Zipf skewness (caching advantage)
 8. Sync interval sensitivity (throughput, FPR, peer hit rate)
 9. Cache size sensitivity (throughput, local hit%, RDMA/op)
+10. Peers queried per peer-read (GIBF targeted vs broadcast)
 """
 
 import os
@@ -36,6 +37,8 @@ from sim_config import (
     ENTRIES_PER_ROW, LOCALITY_F, ROWS_PER_LOCK, LOCKS_PER_MCAS,
     MAX_SEARCH_DEPTH, PREPOPULATE_FILL,
     CLIENT_CACHE_SIZE_BYTES, SYNC_INTERVAL_TICKS,
+    WORKLOADS, REFERENCE_RCUCKOO, SENSITIVITY_NC,
+    ZIPF_THETA_SWEEP, SYNC_INTERVAL_SWEEP, CACHE_SIZE_SWEEP_KB,
 )
 
 RCUCKOO_COLOR = '#4363d8'
@@ -103,31 +106,15 @@ def run_offline_evaluation(offline_config, workloads, client_counts,
 
 def plot_throughput_comparison(rcuckoo_results, offline_results,
                                client_counts, outdir):
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
     titles = {
         "ycsb-c": "YCSB-C (100% read)",
         "ycsb-b": "YCSB-B (95% read)",
         "ycsb-a": "YCSB-A (50% read)",
     }
 
-    reference_data = {
-        "ycsb-c": {
-            "clients": [10, 20, 40, 80, 160, 320],
-            "mops": [2.99, 5.953, 11.494, 22.579, 39.369, 46.493]
-        },
-        "ycsb-b": {
-            "clients": [8, 16, 40, 80, 160, 320],
-            "mops": [1.936, 3.764, 8.914, 16.538, 27.736, 38.570]
-        },
-        "ycsb-a": {
-            "clients": [8, 16, 40, 80, 160, 320],
-            "mops": [0.909, 1.819, 4.275, 7.860, 13.809, 22.353]
-        },
-    }
-
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    for idx, wl in enumerate(workloads):
+    for idx, wl in enumerate(WORKLOADS):
         ax = axes[idx]
 
         rc_clients = sorted(rcuckoo_results[wl].keys())
@@ -140,11 +127,12 @@ def plot_throughput_comparison(rcuckoo_results, offline_results,
         ax.plot(os_clients, os_mops, 's-', color=OFFLINE_COLOR, linewidth=2,
                 markersize=6, label='OfflineState (sim)')
 
-        rd = reference_data[wl]
+        rd = REFERENCE_RCUCKOO[wl]
         ax.plot(rd["clients"], rd["mops"], '^--', color=REFERENCE_COLOR,
                 linewidth=1.5, markersize=5, alpha=0.7,
                 label='RCuckoo (reference)')
-
+        
+        #TODO: remove the ideal linear line
         # Ideal linear scaling reference (based on single-client RCuckoo)
         base_mops = rcuckoo_results[wl][min(rcuckoo_results[wl].keys())]
         base_nc = min(rcuckoo_results[wl].keys())
@@ -168,7 +156,12 @@ def plot_throughput_comparison(rcuckoo_results, offline_results,
 
 
 def plot_read_source_breakdown(offline_stats, client_counts, outdir):
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
+    titles = {
+        "ycsb-c": "YCSB-C (100% read)",
+        "ycsb-b": "YCSB-B (95% read)",
+        "ycsb-a": "YCSB-A (50% read)",
+    }
+
     titles = {
         "ycsb-c": "YCSB-C (100% read)",
         "ycsb-b": "YCSB-B (95% read)",
@@ -177,7 +170,7 @@ def plot_read_source_breakdown(offline_stats, client_counts, outdir):
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    for idx, wl in enumerate(workloads):
+    for idx, wl in enumerate(WORKLOADS):
         ax = axes[idx]
         local_pct = []
         peer_pct = []
@@ -201,7 +194,7 @@ def plot_read_source_breakdown(offline_stats, client_counts, outdir):
         ax.bar(x, local_pct, width, label='Local cache',
                color='#3cb44b')
         ax.bar(x, peer_pct, width, bottom=local_pct,
-               label='Peer (broadcast)', color='#4363d8')
+               label='Peer (GIBF targeted)', color='#4363d8')
         ax.bar(x, server_pct, width,
                bottom=[l + p for l, p in zip(local_pct, peer_pct)],
                label='Server', color='#e6194B')
@@ -226,8 +219,12 @@ def plot_bloom_fpr(offline_stats, client_counts, outdir,
                    offline_config=None):
     """Plot 6: Bloom filter false positive rate vs clients + theoretical line."""
     import math
+    titles = {
+        "ycsb-c": "YCSB-C (100% read)",
+        "ycsb-b": "YCSB-B (95% read)",
+        "ycsb-a": "YCSB-A (50% read)",
+    }
 
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
     titles = {
         "ycsb-c": "YCSB-C (100% read)",
         "ycsb-b": "YCSB-B (95% read)",
@@ -236,30 +233,45 @@ def plot_bloom_fpr(offline_stats, client_counts, outdir,
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    for idx, wl in enumerate(workloads):
+    for idx, wl in enumerate(WORKLOADS):
         ax = axes[idx]
 
         fpr_vals = []
-        fpr_theory = []
+        fpr_theory_merged = []
+        fpr_theory_gibf = []
         for nc in client_counts:
             s = offline_stats[wl][nc]
             fp = s.get('false_positives', 0)
             bloom_yes = fp + s['peer_hits']
             fpr_vals.append(fp / bloom_yes * 100 if bloom_yes > 0 else 0)
 
-            # Theoretical FPR: p = (1 - e^(-kn/m))^k
             if offline_config:
+                # Theoretical merged bloom FPR (old approach)
                 m, k = offline_config.effective_bloom_params(nc)
                 n = offline_config.max_cache_entries * nc
                 p = (1 - math.exp(-k * n / m)) ** k
-                fpr_theory.append(p * 100)
+                fpr_theory_merged.append(p * 100)
+
+                # Theoretical GIBF per-group FPR
+                num_groups = min(offline_config.num_peer_groups, nc)
+                group_size = max(1, nc // num_groups)
+                m_g, k_g = offline_config.gibf_params(nc)
+                n_g = offline_config.max_cache_entries * group_size
+                p_g = (1 - math.exp(-k_g * n_g / m_g)) ** k_g
+                fpr_theory_gibf.append(p_g * 100)
 
         ax.plot(client_counts, fpr_vals, 's-', color=OFFLINE_COLOR,
-                linewidth=2, markersize=6, label='Empirical')
-        if fpr_theory:
-            ax.plot(client_counts, fpr_theory, 's--', color=OFFLINE_COLOR,
+                linewidth=2, markersize=6, label='GIBF (empirical)')
+        if fpr_theory_merged:
+            ax.plot(client_counts, fpr_theory_merged, '^--',
+                    color=REFERENCE_COLOR,
+                    linewidth=1.5, markersize=5, alpha=0.7,
+                    label='Merged bloom (theoretical)')
+        if fpr_theory_gibf:
+            ax.plot(client_counts, fpr_theory_gibf, 'o--',
+                    color=OFFLINE_COLOR,
                     linewidth=1, markersize=4, alpha=0.5,
-                    label='Theoretical')
+                    label='GIBF (theoretical)')
 
         ax.set_xlabel('Clients')
         ax.set_ylabel('Bloom FPR (%)')
@@ -278,7 +290,12 @@ def plot_bloom_fpr(offline_stats, client_counts, outdir,
 
 def plot_rdma_per_op(rcuckoo_stats, offline_stats, client_counts, outdir):
     """Plot 4: RDMA calls per operation vs clients."""
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
+    titles = {
+        "ycsb-c": "YCSB-C (100% read)",
+        "ycsb-b": "YCSB-B (95% read)",
+        "ycsb-a": "YCSB-A (50% read)",
+    }
+
     titles = {
         "ycsb-c": "YCSB-C (100% read)",
         "ycsb-b": "YCSB-B (95% read)",
@@ -287,7 +304,7 @@ def plot_rdma_per_op(rcuckoo_stats, offline_stats, client_counts, outdir):
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    for idx, wl in enumerate(workloads):
+    for idx, wl in enumerate(WORKLOADS):
         ax = axes[idx]
 
         rc_rpo = []
@@ -322,7 +339,12 @@ def plot_rdma_per_op(rcuckoo_stats, offline_stats, client_counts, outdir):
 
 def plot_latency_cdf(offline_stats, client_counts, config, outdir):
     """Plot 5: Read latency CDF — staircase showing local/peer/server tiers."""
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
+    titles = {
+        "ycsb-c": "YCSB-C (100% read)",
+        "ycsb-b": "YCSB-B (95% read)",
+        "ycsb-a": "YCSB-A (50% read)",
+    }
+
     titles = {
         "ycsb-c": "YCSB-C (100% read)",
         "ycsb-b": "YCSB-B (95% read)",
@@ -334,7 +356,7 @@ def plot_latency_cdf(offline_stats, client_counts, config, outdir):
 
     fig, axes = plt.subplots(1, 3, figsize=(15, 5))
 
-    for idx, wl in enumerate(workloads):
+    for idx, wl in enumerate(WORKLOADS):
         ax = axes[idx]
         s = offline_stats[wl][nc]
         lats = np.array(s.get('read_latencies', []))
@@ -370,7 +392,7 @@ def plot_latency_cdf(offline_stats, client_counts, config, outdir):
 
         ax.set_xlabel('Latency (ticks)')
         ax.set_ylabel('CDF')
-        ax.set_title(f'{titles[wl]} ({nc} clients)')
+        ax.set_title(f'{titles.get(wl, wl)} ({nc} clients)')
         ax.legend(loc='lower right', fontsize=8)
         ax.grid(True, alpha=0.3)
         ax.set_xlim(-0.5, config.server_rtt_ticks + 1.5)
@@ -386,8 +408,8 @@ def plot_latency_cdf(offline_stats, client_counts, config, outdir):
 def plot_skewness_sensitivity(rcuckoo_config_base, offline_config_base,
                                outdir):
     """Plot 7: Throughput vs Zipf skewness — shows caching advantage."""
-    thetas = [0.5, 0.7, 0.8, 0.9, 0.95, 0.99]
-    nc = 80
+    thetas = ZIPF_THETA_SWEEP
+    nc = SENSITIVITY_NC
     wl = "ycsb-c"
 
     rc_mops = []
@@ -454,8 +476,8 @@ def plot_skewness_sensitivity(rcuckoo_config_base, offline_config_base,
 
 def plot_sync_sensitivity(config_base, outdir, pregenerated):
     """Plot 8: Sync interval sensitivity — throughput, FPR, peer hit rate."""
-    sync_intervals = [10, 50, 100, 500, 1000, 5000]
-    nc = 80
+    sync_intervals = SYNC_INTERVAL_SWEEP
+    nc = SENSITIVITY_NC
     wl = "ycsb-c"
 
     throughputs = []
@@ -519,8 +541,8 @@ def plot_sync_sensitivity(config_base, outdir, pregenerated):
 
 def plot_cache_sensitivity(config_base, outdir, pregenerated):
     """Plot 9: Cache size sensitivity — throughput, local hit%, RDMA/op."""
-    cache_sizes_kb = [8, 16, 32, 64, 128, 256]
-    nc = 80
+    cache_sizes_kb = CACHE_SIZE_SWEEP_KB
+    nc = SENSITIVITY_NC
     wl = "ycsb-c"
 
     throughputs = []
@@ -578,6 +600,38 @@ def plot_cache_sensitivity(config_base, outdir, pregenerated):
     print(f"  Plot saved: {path}")
 
 
+def plot_peers_per_query(offline_stats, client_counts, offline_config, outdir):
+    """Plot 10: Peers queried per peer-read (GIBF targeted vs broadcast)."""
+    wl = "ycsb-c"
+
+    gibf_peers = []
+    broadcast_peers = []
+    for nc in client_counts:
+        s = offline_stats[wl][nc]
+        gibf_peers.append(s.get('peers_per_peer_read', nc - 1))
+        broadcast_peers.append(nc - 1)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.plot(client_counts, broadcast_peers, '^--', color=REFERENCE_COLOR,
+            linewidth=2, markersize=6, label='Broadcast (all N-1)')
+    ax.plot(client_counts, gibf_peers, 's-', color=OFFLINE_COLOR,
+            linewidth=2, markersize=6, label='GIBF (targeted groups)')
+
+    ax.set_xlabel('Clients')
+    ax.set_ylabel('Peers queried per peer-read')
+    ax.set_title('Peer Query Scope: GIBF vs Broadcast (YCSB-C)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    ax.set_xlim(0, max(client_counts) + 20)
+    ax.set_ylim(bottom=0)
+
+    plt.tight_layout()
+    path = os.path.join(outdir, 'plot10_peers_per_query.png')
+    plt.savefig(path, dpi=150)
+    plt.close()
+    print(f"  Plot saved: {path}")
+
+
 def main():
     outdir = os.path.dirname(os.path.abspath(__file__))
     client_counts = CLIENT_COUNTS
@@ -615,7 +669,7 @@ def main():
     print("COMPARISON: RCuckoo vs OfflineState")
     print("=" * 60)
 
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
+    workloads = WORKLOADS
 
     # Pre-generate workloads once so both systems use identical data
     max_ops = max(c * OPS_PER_CLIENT for c in client_counts)
@@ -668,6 +722,9 @@ def main():
     print("\n--- Plot 9: Cache Size Sensitivity ---")
     plot_cache_sensitivity(offline_config, outdir, pregenerated)
 
+    print("\n--- Plot 10: Peers per Query (GIBF) ---")
+    plot_peers_per_query(offline_stats, client_counts, offline_config, outdir)
+
     # Summary table
     print(f"\n{'='*100}")
     print("THROUGHPUT (MOPS)")
@@ -690,7 +747,7 @@ def main():
     print(f"{'='*100}")
     header2 = f"{'Clients':>8}"
     for wl in workloads:
-        header2 += f" | {'RC':>7} {'OS':>7} {'FPR%':>6}"
+        header2 += f" | {'RC':>7} {'OS':>7} {'FPR%':>6} {'P/Q':>5}"
     print(header2)
     print("-" * len(header2))
     for nc in client_counts:
@@ -703,7 +760,8 @@ def main():
             os_fp = os_.get('false_positives', 0)
             os_by = os_fp + os_.get('peer_hits', 0)
             os_fpr = os_fp / os_by * 100 if os_by > 0 else 0
-            row += f" | {rc_rpo:>7.3f} {os_rpo:>7.3f} {os_fpr:>5.1f}%"
+            ppq = os_.get('peers_per_peer_read', nc - 1)
+            row += f" | {rc_rpo:>7.3f} {os_rpo:>7.3f} {os_fpr:>5.1f}% {ppq:>5.1f}"
         print(row)
     print(f"{'='*100}")
 

@@ -12,20 +12,19 @@ An offline sync worker periodically rebuilds and merges bloom filters.
 """
 
 import time
-from typing import Optional
+from collections import defaultdict
 
 import numpy as np
 
 from offline_state.config import OfflineStateConfig
 from offline_state.bloom_filter import BloomFilter
+from offline_state.gibf import GroupIndexedBloomFilter
 from offline_state.client import (
     OfflineClient,
-    PHASE_IDLE, PHASE_PEER_READ,
+    PHASE_IDLE, PHASE_PEER_READ, PHASE_PEER_READ_GROUP,
     PHASE_SERVER_READ, PHASE_SERVER_WRITE,
 )
-
-# Reuse workload generation from rcuckoo
-from rcuckoo.workload import generate_workload
+from sim_config import OPS_PER_CLIENT, MIN_OPS
 
 
 def _any_peer_has_key(clients, requesting_client_id, key):
@@ -33,36 +32,54 @@ def _any_peer_has_key(clients, requesting_client_id, key):
     for c in clients:
         if c.client_id == requesting_client_id:
             continue
+        # Exact cache lookup (simulation uses ground truth, not bloom filter)
         if key in c.cache:
             return True
     return False
 
 
-def run_offline_sync(clients):
+def _any_group_peer_has_key(clients_by_group, requesting_client_id, key, target_groups):
+    """Check if any peer in the target groups has the key (GIBF targeted query)."""
+    for gid in target_groups:
+        for c in clients_by_group[gid]:
+            if c.client_id != requesting_client_id and key in c.cache:
+                return True
+    return False
+
+
+def run_offline_sync(clients, gibf=None):
     """
-    Offline sync worker: rebuild bloom filters and merge.
+    Offline sync worker: rebuild bloom filters and GIBF.
 
     1. Each client rebuilds its local bloom filter from current cache keys
-    2. Compute bitwise OR of all local bloom filters
-    3. Write result as each client's peer bloom filter
+    2. Build GIBF: for each client's cached keys, set group bit at hash positions
+    3. Share GIBF reference with all clients
     """
     for c in clients:
         c.local_bloom.rebuild_from_keys(c.cache.keys())
 
-    local_blooms = [c.local_bloom for c in clients]
-    merged = BloomFilter.bitwise_or(local_blooms)
-
-    for c in clients:
-        c.peer_bloom = merged.copy()
+    if gibf is not None:
+        gibf.clear()
+        for c in clients:
+            gid = c.group_id
+            for key in c.cache:
+                gibf.add(key, gid)
+        for c in clients:
+            c.gibf = gibf
+    else:
+        # Fallback: legacy merged bloom
+        local_blooms = [c.local_bloom for c in clients]
+        merged = BloomFilter.bitwise_or(local_blooms)
+        for c in clients:
+            c.peer_bloom = merged.copy()
 
 
 def tick_client(client, clients, config, workload_keys, workload_is_read,
-                op_idx_holder):
+                op_idx_holder, current_tick=0, clients_by_group=None):
     """
     Advance one client by one tick.
-
-    Local cache hits are FREE (0 RTT) — the client loops and processes
-    multiple local hits within a single tick, since local memory access
+    Local cache is free, 0 RTT, the client loops and processes
+    multiple local hits within a single tick, simulates that local memory access
     (~100ns) is ~30x faster than an RDMA RTT (~3us).
 
     Returns True if at least one operation completed this tick.
@@ -80,6 +97,7 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
         key = int(workload_keys[idx])
         client.op_key = key
         is_read = workload_is_read[idx]
+        client.op_start_tick = current_tick
 
         if is_read:
             client.op_type = 'read'
@@ -87,11 +105,19 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
             if client.cache_get(key) is not None:
                 client.ops_completed += 1
                 client.local_hits += 1
+                client.read_latencies.append(0)
                 completed_any = True
                 continue  # FREE — try next op in same tick
 
-            # Check peer bloom filter
-            if client.peer_bloom.contains(key):
+            # Check GIBF or peer bloom filter
+            if client.gibf is not None:
+                candidate_groups = client.gibf.query_excluding(
+                    key, client.group_id)
+                if candidate_groups:
+                    client.target_groups = candidate_groups
+                    client.phase = PHASE_PEER_READ_GROUP
+                    break
+            elif client.peer_bloom.contains(key):
                 client.phase = PHASE_PEER_READ
                 break
 
@@ -104,16 +130,38 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
             break
 
     if client.phase == PHASE_PEER_READ:
-        # Broadcast to peers (1 tick, same rack)
-        client.rdma_calls += 1
+        # Broadcast to peers (1 tick, same rack) — N-1 actual RDMA reads
+        client.rdma_calls += len(clients) - 1
         if _any_peer_has_key(clients, client.client_id, client.op_key):
             client.cache_put(client.op_key, client.op_key)
             client.ops_completed += 1
             client.peer_hits += 1
+            client.read_latencies.append(current_tick - client.op_start_tick + 1)
             client.phase = PHASE_IDLE
             return True
         else:
             # False positive — fall through to server next tick
+            client.false_positives += 1
+            client.phase = PHASE_SERVER_READ
+            return False
+
+    if client.phase == PHASE_PEER_READ_GROUP:
+        # GIBF: targeted query to candidate groups only (1 tick, same rack)
+        num_groups = len(client.target_groups)
+        group_size = len(clients) // client.gibf.num_groups if client.gibf else 1
+        client.rdma_calls += num_groups * group_size
+        client.group_peer_queries += 1
+        if _any_group_peer_has_key(clients_by_group, client.client_id,
+                                   client.op_key, client.target_groups):
+            client.cache_put(client.op_key, client.op_key)
+            client.ops_completed += 1
+            client.peer_hits += 1
+            client.read_latencies.append(current_tick - client.op_start_tick + 1)
+            client.phase = PHASE_IDLE
+            return True
+        else:
+            # False positive — fall through to server next tick
+            client.false_positives += 1
             client.phase = PHASE_SERVER_READ
             return False
 
@@ -128,6 +176,7 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
         client.cache_put(client.op_key, client.op_key)
         client.ops_completed += 1
         client.server_hits += 1
+        client.read_latencies.append(current_tick - client.op_start_tick + 1)
         client.phase = PHASE_IDLE
         return True
 
@@ -142,6 +191,7 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
         if client.op_key in client.cache:
             client.cache_put(client.op_key, client.op_key + 1)
         client.ops_completed += 1
+        client.write_latencies.append(current_tick - client.op_start_tick + 1)
         client.phase = PHASE_IDLE
         return True
 
@@ -150,29 +200,37 @@ def tick_client(client, clients, config, workload_keys, workload_is_read,
 
 def run_simulation(config: OfflineStateConfig, workload_type: str,
                    num_clients: int,
-                   bloom_fill_callback=None,
-                   pregenerated_workload=None) -> tuple:
+                   pregenerated_workload: tuple = None) -> tuple:
     """
     Run OfflineState simulation.
 
     Returns (mops, stats_dict) where stats_dict contains:
         local_hits, peer_hits, server_hits (totals across all clients)
-    """
-    num_ops = max(num_clients * 50000, 200000)
-    if pregenerated_workload is not None:
-        key_samples = pregenerated_workload[0][:num_ops]
-        is_read = pregenerated_workload[1][:num_ops]
-    else:
-        key_samples, is_read = generate_workload(
-            workload_type, config.total_entries, config.zipf_theta, num_ops
-        )
 
+    pregenerated_workload: (key_samples, is_read) tuple — required for fair
+    comparison; both engines must use the same workload.
+    """
+    num_ops = max(num_clients * OPS_PER_CLIENT, MIN_OPS)
+    key_samples = pregenerated_workload[0][:num_ops]
+    is_read = pregenerated_workload[1][:num_ops]
+
+    bloom_size, bloom_hashes = config.effective_bloom_params(num_clients)
+    num_groups = min(config.num_peer_groups, num_clients)
     clients = [
         OfflineClient(i, config.max_cache_entries,
-                      config.bloom_filter_size_bits,
-                      config.bloom_filter_num_hashes)
+                      bloom_size, bloom_hashes,
+                      group_id=i % num_groups)
         for i in range(num_clients)
     ]
+
+    # Create GIBF
+    gibf_size, gibf_hashes = config.gibf_params(num_clients)
+    gibf = GroupIndexedBloomFilter(gibf_size, gibf_hashes, num_groups)
+
+    # Pre-group clients for O(group_size) peer lookups instead of O(N)
+    clients_by_group = defaultdict(list)
+    for c in clients:
+        clients_by_group[c.group_id].append(c)
 
     ops_per_client = num_ops // num_clients
     op_indices = [[i * ops_per_client] for i in range(num_clients)]
@@ -192,22 +250,17 @@ def run_simulation(config: OfflineStateConfig, workload_type: str,
     for tick in range(total_ticks):
         # Offline sync at configured intervals
         if tick > 0 and tick % config.sync_interval_ticks == 0:
-            run_offline_sync(clients)
-            if bloom_fill_callback is not None:
-                avg_local = np.mean([c.local_bloom.fill_rate() for c in clients])
-                avg_peer = np.mean([c.peer_bloom.fill_rate() for c in clients])
-                avg_cache_size = np.mean([len(c.cache) for c in clients])
-                bloom_fill_callback(tick, avg_local, avg_peer, avg_cache_size)
+            run_offline_sync(clients, gibf=gibf)
 
         np.random.shuffle(client_order)
 
-        # No NIC bandwidth constraint — only RTT latency matters.
-        # Each client has its own NIC; there is no shared bottleneck.
         for c_idx in client_order:
             client = clients[c_idx]
             tick_client(
                 client, clients, config,
-                wl_keys[c_idx], wl_reads[c_idx], op_indices[c_idx]
+                wl_keys[c_idx], wl_reads[c_idx], op_indices[c_idx],
+                current_tick=tick,
+                clients_by_group=clients_by_group,
             )
 
     wall_time = time.monotonic() - start_time
@@ -216,18 +269,36 @@ def run_simulation(config: OfflineStateConfig, workload_type: str,
     total_peer = sum(c.peer_hits for c in clients)
     total_server = sum(c.server_hits for c in clients)
     total_rdma = sum(c.rdma_calls for c in clients)
+    total_fp = sum(c.false_positives for c in clients)
+    total_group_queries = sum(c.group_peer_queries for c in clients)
 
     simulated_time_seconds = total_ticks * config.rdma_rtt_us / 1_000_000
     mops = total_ops / simulated_time_seconds / 1_000_000
     rdma_per_op = total_rdma / total_ops if total_ops > 0 else 0
 
+    # Peers queried per peer-read: GIBF queries target group_size peers,
+    # broadcast queries target N-1 peers.
+    group_size = num_clients // num_groups if num_groups > 0 else num_clients
+    broadcast_peer_reads = total_peer + total_fp - total_group_queries
+    peers_queried = (total_group_queries * group_size +
+                     broadcast_peer_reads * (num_clients - 1))
+    peers_per_peer_read = (peers_queried / (total_peer + total_fp)
+                           if (total_peer + total_fp) > 0 else 0)
+
     print(f"  {workload_type.upper()} | {num_clients} clients | "
           f"{total_ops:,} ops in {total_ticks:,} ticks "
           f"({simulated_time_seconds*1000:.1f}ms sim) | "
           f"{mops:.3f} MOPS | "
-          f"local={total_local} peer={total_peer} server={total_server} | "
-          f"RDMA/op={rdma_per_op:.3f} | "
+          f"local={total_local} peer={total_peer} server={total_server} FP={total_fp} | "
+          f"RDMA/op={rdma_per_op:.3f} peers/query={peers_per_peer_read:.1f} | "
           f"wall={wall_time:.1f}s")
+
+    # Collect latency data
+    all_read_latencies = []
+    all_write_latencies = []
+    for c in clients:
+        all_read_latencies.extend(c.read_latencies)
+        all_write_latencies.extend(c.write_latencies)
 
     stats = {
         'local_hits': total_local,
@@ -235,6 +306,11 @@ def run_simulation(config: OfflineStateConfig, workload_type: str,
         'server_hits': total_server,
         'total_ops': total_ops,
         'total_rdma': total_rdma,
+        'false_positives': total_fp,
+        'read_latencies': all_read_latencies,
+        'write_latencies': all_write_latencies,
+        'group_peer_queries': total_group_queries,
+        'peers_per_peer_read': peers_per_peer_read,
     }
 
     return mops, stats

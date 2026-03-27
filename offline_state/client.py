@@ -16,20 +16,25 @@ PHASE_IDLE = 0
 PHASE_PEER_READ = 1        # broadcast read to all peers (1 RTT)
 PHASE_SERVER_READ = 2      # one-sided RDMA read from server (1 RTT)
 PHASE_SERVER_WRITE = 3     # one-sided RDMA write to server (1 RTT)
+PHASE_PEER_READ_GROUP = 4  # GIBF: targeted read to candidate groups (1 RTT)
 
 
 class OfflineClient:
     __slots__ = (
-        'client_id', 'phase', 'op_key', 'op_type',
+        'client_id', 'group_id', 'phase', 'op_key', 'op_type',
         'cache', 'max_cache_entries',
-        'local_bloom', 'peer_bloom',
+        'local_bloom', 'peer_bloom', 'gibf',
         'ops_completed', 'local_hits', 'peer_hits', 'server_hits',
-        'rdma_calls', 'ticks_remaining',
+        'rdma_calls', 'ticks_remaining', 'false_positives',
+        'op_start_tick', 'read_latencies', 'write_latencies',
+        'target_groups', 'group_peer_queries',
     )
 
     def __init__(self, client_id: int, max_cache_entries: int,
-                 bloom_size_bits: int, bloom_num_hashes: int):
+                 bloom_size_bits: int, bloom_num_hashes: int,
+                 group_id: int = 0):
         self.client_id = client_id
+        self.group_id = group_id
         self.phase = PHASE_IDLE
         self.op_key = 0
         self.op_type = 'read'
@@ -39,6 +44,7 @@ class OfflineClient:
 
         self.local_bloom = BloomFilter(bloom_size_bits, bloom_num_hashes)
         self.peer_bloom = BloomFilter(bloom_size_bits, bloom_num_hashes)
+        self.gibf = None  # set by engine after sync
 
         self.ops_completed = 0
         self.local_hits = 0
@@ -46,6 +52,12 @@ class OfflineClient:
         self.server_hits = 0
         self.rdma_calls = 0
         self.ticks_remaining = 0
+        self.false_positives = 0
+        self.op_start_tick = 0
+        self.read_latencies = []
+        self.write_latencies = []
+        self.target_groups = set()
+        self.group_peer_queries = 0  # count of GIBF-targeted peer reads
 
     def cache_get(self, key: int):
         """LRU lookup. Returns value if present, else None."""

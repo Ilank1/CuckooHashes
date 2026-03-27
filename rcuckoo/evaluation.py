@@ -4,15 +4,25 @@ import numpy as np
 
 from rcuckoo.config import RCuckooConfig
 from rcuckoo.table import IndexTable
-from rcuckoo.workload import prepopulate
+from rcuckoo.workload import generate_workload, prepopulate
 from rcuckoo.engine import run_simulation
+from sim_config import OPS_PER_CLIENT, MIN_OPS, WORKLOADS, REFERENCE_RCUCKOO
 
 
 def run_figure6(config: RCuckooConfig):
     """Run throughput (MOPS) vs number of clients for YCSB-C, YCSB-B, YCSB-A."""
-    workloads = ["ycsb-c", "ycsb-b", "ycsb-a"]
+    workloads = WORKLOADS
     client_counts = config.figure6_client_counts
     results = {wl: {} for wl in workloads}
+
+    # Pre-generate workloads
+    max_ops = max(c * OPS_PER_CLIENT for c in client_counts)
+    max_ops = max(max_ops, MIN_OPS)
+    pregenerated = {}
+    for wl in workloads:
+        key_samples, is_read = generate_workload(
+            wl, config.total_entries, config.zipf_theta, max_ops)
+        pregenerated[wl] = (key_samples, is_read)
 
     for wl in workloads:
         print(f"\n{'='*60}")
@@ -25,7 +35,9 @@ def run_figure6(config: RCuckooConfig):
         for nc in client_counts:
             mops_trials = []
             for trial in range(config.num_trials):
-                mops, _stats = run_simulation(config, wl, nc, shared_table=table)
+                mops, _stats = run_simulation(
+                    config, wl, nc, shared_table=table,
+                    pregenerated_workload=pregenerated[wl])
                 mops_trials.append(mops)
             results[wl][nc] = np.mean(mops_trials)
 
@@ -69,22 +81,8 @@ def plot_results(results: dict):
             "ycsb-b": "(b) 95% read, 5% update (YCSB-B)",
             "ycsb-a": "(c) 50% read, 50% update (YCSB-A)"
         }
-        reference_data = {
-            "ycsb-c": {
-                "clients": [10, 20, 40, 80, 160, 320],
-                "mops": [2.99, 5.953, 11.494, 22.579, 39.369, 46.493]
-            },
-            "ycsb-b": {
-                "clients": [8, 16, 40, 80, 160, 320],
-                "mops": [1.936, 3.764, 8.914, 16.538, 27.736, 38.570]
-            },
-            "ycsb-a": {
-                "clients": [8, 16, 40, 80, 160, 320],
-                "mops": [0.909, 1.819, 4.275, 7.860, 13.809, 22.353]
-            },
-        }
 
-        for idx, wl in enumerate(["ycsb-c", "ycsb-b", "ycsb-a"]):
+        for idx, wl in enumerate(WORKLOADS):
             ax = axes[idx]
             wl_results = results[wl]
             clients = sorted(wl_results.keys())
@@ -93,7 +91,7 @@ def plot_results(results: dict):
             ax.plot(clients, mops, 'o-', color='#4363d8', linewidth=2,
                     markersize=6, label='RCuckoo (sim)')
 
-            rd = reference_data[wl]
+            rd = REFERENCE_RCUCKOO[wl]
             ax.plot(rd["clients"], rd["mops"], 's--', color='#e6194B',
                     linewidth=1.5, markersize=5, alpha=0.7,
                     label='RCuckoo (reference)')

@@ -1,13 +1,4 @@
-"""
-Cuckoo path search and execution (Section 3.2.3).
-
-Grant & Snoeren, ATC'25:
-    "We use breadth-first search (BFS) to identify short paths in an
-    attempt to minimize bandwidth and locking overhead."
-
-    "cuckooing elements one at a time, starting by moving the last
-    entry in the path to the empty location"
-"""
+"""Cuckoo path search and execution using BFS."""
 
 from collections import deque
 from typing import Optional
@@ -20,13 +11,7 @@ from rcuckoo.table import IndexTable
 
 
 def group_locks_for_mcas(lock_indices: list, locks_per_mcas: int) -> list:
-    """
-    Group locks into MCAS groups (Section 3.4.1).
-
-    "clients group the necessary locks into the smallest number of sets
-    as possible (where each set is an attempt to acquire one or more locks
-    within a single 64-bit span)"
-    """
+    """Group locks into MCAS groups (each group fits in one 64-bit CAS)."""
     sorted_locks = sorted(set(lock_indices))
     if not sorted_locks:
         return []
@@ -46,10 +31,9 @@ def bfs_search_locked(table: IndexTable, config: RCuckooConfig,
                       key: int, L1: int, L2: int,
                       locked_rows: set) -> Optional[list]:
     """
-    BFS search for a cuckoo eviction path within locked rows (Section 3.2.3).
+    BFS search for a cuckoo eviction path within locked rows.
 
-    Returns a list of moves [{from_row, from_slot, to_row, to_slot, key, value}]
-    or None if no path of depth <= max_search_depth exists.
+    Returns a list of moves or None if no path found within max_search_depth.
     """
     queue = deque()
     visited = set()
@@ -109,12 +93,7 @@ def bfs_search_locked(table: IndexTable, config: RCuckooConfig,
 
 
 def execute_cuckoo_path(table: IndexTable, path: list):
-    """
-    Execute a cuckoo eviction path in reverse order (Section 3.2.3).
-
-    Moves entries one at a time starting from the last in the path
-    toward the empty slot.
-    """
+    """Execute a cuckoo eviction path in reverse order."""
     for move in reversed(path):
         fr, fs = move['from_row'], move['from_slot']
         tr, ts = move['to_row'], move['to_slot']

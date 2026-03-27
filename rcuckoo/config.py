@@ -2,55 +2,62 @@
 
 from dataclasses import dataclass, field
 
+from sim_config import (
+    TOTAL_ENTRIES, ENTRIES_PER_ROW, LOCALITY_F, ROWS_PER_LOCK,
+    LOCKS_PER_MCAS, MAX_SEARCH_DEPTH, RCUCKOO_CLIENT_CACHE_SIZE_BYTES,
+    PREPOPULATE_FILL, ZIPF_THETA, RDMA_RTT_US, SERVER_RTT_TICKS,
+    NIC_BANDWIDTH_GBPS, CLIENT_COUNTS, SIM_DURATION_US, NUM_TRIALS,
+)
+
 
 @dataclass
 class RCuckooConfig:
     # Table parameters
-    total_entries: int = 100_000_000
-    entries_per_row: int = 8
+    total_entries: int = TOTAL_ENTRIES
+    entries_per_row: int = ENTRIES_PER_ROW
     key_size_bits: int = 32
     value_size_bits: int = 32
 
     # Dependent hashing
-    locality_f: float = 2.3
+    locality_f: float = LOCALITY_F
     hash_salt_1: int = 0xDEADBEEF
     hash_salt_2: int = 0xCAFEBABE
     hash_salt_3: int = 0x12345678
 
     # Locking
-    rows_per_lock: int = 16
-    locks_per_mcas: int = 64
+    rows_per_lock: int = ROWS_PER_LOCK
+    locks_per_mcas: int = LOCKS_PER_MCAS
 
     # Cuckoo search
-    max_search_depth: int = 5
+    max_search_depth: int = MAX_SEARCH_DEPTH
 
     # Client cache
-    client_cache_size_bytes: int = 64 * 1024
+    client_cache_size_bytes: int = RCUCKOO_CLIENT_CACHE_SIZE_BYTES
 
     # Pre-population
-    prepopulate_fill: float = 0.9
+    prepopulate_fill: float = PREPOPULATE_FILL
 
     # Workload
-    zipf_theta: float = 0.99
+    zipf_theta: float = ZIPF_THETA
 
     # RDMA timing
-    rdma_rtt_us: float = 1.0
-    server_rtt_ticks: int = 3  # server access cost in ticks (cross-rack)
+    rdma_rtt_us: float = RDMA_RTT_US
+    server_rtt_ticks: int = SERVER_RTT_TICKS
 
     # NIC capacity
-    nic_bandwidth_gbps: float = 100.0
+    nic_bandwidth_gbps: float = NIC_BANDWIDTH_GBPS
     nic_max_read_ops_per_us: int = 75
     nic_max_cas_ops_per_us: int = 50
     read_threshold_bytes: int = 256
 
     # Evaluation
     figure6_client_counts: list = field(
-        default_factory=lambda: [8, 16, 40, 80, 160, 320]
+        default_factory=lambda: list(CLIENT_COUNTS)
     )
 
     # Simulation
-    sim_duration_us: int = 100_000
-    num_trials: int = 1
+    sim_duration_us: int = SIM_DURATION_US
+    num_trials: int = NUM_TRIALS
 
     @property
     def num_rows(self) -> int:

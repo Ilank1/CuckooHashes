@@ -23,7 +23,8 @@ from rcuckoo.client import (
 from rcuckoo.cuckoo import (
     group_locks_for_mcas, bfs_search_locked, execute_cuckoo_path,
 )
-from rcuckoo.workload import generate_workload, prepopulate
+from rcuckoo.workload import prepopulate
+from sim_config import OPS_PER_CLIENT, MIN_OPS, LOCK_RETRY_LIMIT
 
 
 def _start_new_op(client, table, lock_table, config, workload_keys,
@@ -109,7 +110,7 @@ def tick_client(client, table, lock_table, config,
                 client.phase = PHASE_UPDATE_WRITE
         else:
             client.lock_retries += 1
-            if client.lock_retries > 200:
+            if client.lock_retries > LOCK_RETRY_LIMIT:
                 lock_table.release_all(client.acquired_locks)
                 client.acquired_locks = []
                 client.phase = PHASE_IDLE
@@ -161,7 +162,7 @@ def tick_client(client, table, lock_table, config,
                 client.phase = PHASE_INSERT_SEARCH
         else:
             client.lock_retries += 1
-            if client.lock_retries > 200:
+            if client.lock_retries > LOCK_RETRY_LIMIT:
                 lock_table.release_all(client.acquired_locks)
                 client.acquired_locks = []
                 client.phase = PHASE_IDLE
@@ -242,14 +243,9 @@ def run_simulation(config: RCuckooConfig, workload_type: str,
 
     lock_table = LockTable(config.num_locks)
 
-    num_ops = max(num_clients * 50000, 200000)
-    if pregenerated_workload is not None:
-        key_samples = pregenerated_workload[0][:num_ops]
-        is_read = pregenerated_workload[1][:num_ops]
-    else:
-        key_samples, is_read = generate_workload(
-            workload_type, table.total_entries, config.zipf_theta, num_ops
-        )
+    num_ops = max(num_clients * OPS_PER_CLIENT, MIN_OPS)
+    key_samples = pregenerated_workload[0][:num_ops]
+    is_read = pregenerated_workload[1][:num_ops]
 
     clients = [ClientState(i, config.cache_rows) for i in range(num_clients)]
 
